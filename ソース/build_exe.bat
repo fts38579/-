@@ -1,25 +1,23 @@
 @echo off
-chcp 65001 > nul
 setlocal
-title カワウソマネージャー きなこ - EXE ビルド（統合版）
+title Kawauso Manager Kinako - Build EXE
 cd /d "%~dp0"
 
 echo.
 echo ============================================================
-echo   カワウソマネージャー きなこ  統合EXE ビルド開始
+echo   Kawauso Manager Kinako - Build Start
 echo ============================================================
 echo.
 
-echo [準備] 必要ライブラリをインストール中...
+echo [Step 0] Installing required libraries...
 py -m pip install pyinstaller tkcalendar --quiet
-if %ERRORLEVEL% neq 0 ( echo ❌ 失敗 & pause & exit /b 1 )
-echo ✅ 準備完了
+if %ERRORLEVEL% neq 0 ( echo [ERROR] pip install failed & pause & exit /b 1 )
+echo [OK] Libraries ready.
 echo.
 
-:: ── 統合アプリ（カワウソマネージャー きなこ.exe）────────────────
-echo [1/1] カワウソマネージャー きなこ.exe をビルド中...
+echo [Step 1/1] Building EXE...
 py -m PyInstaller --onefile --windowed ^
-  --name "カワウソマネージャー きなこ" ^
+  --name "kawauso-kinako" ^
   --distpath ".." ^
   --workpath "build" ^
   --specpath "." ^
@@ -35,14 +33,13 @@ py -m PyInstaller --onefile --windowed ^
   --collect-all tkcalendar ^
   --collect-all babel ^
   app.py
-if %ERRORLEVEL% neq 0 ( echo ❌ 失敗 & pause & exit /b 1 )
-echo ✅ [1/1] 完了
+if %ERRORLEVEL% neq 0 ( echo [ERROR] Build failed & pause & exit /b 1 )
+echo [OK] Step 1/1 done.
 echo.
 
 echo ============================================================
-echo   ✅ ビルド完了！
-echo   プロジェクトフォルダ直下に
-echo   「カワウソマネージャー きなこ.exe」が生成されました
+echo   Build complete!
+echo   Output: kawauso-kinako.exe (in project root folder)
 echo ============================================================
 pause
 endlocal
