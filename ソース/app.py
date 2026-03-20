@@ -396,7 +396,11 @@ class LiveWorker(QThread):
 
     def run(self):
         try:
-            import asyncio, config
+            import asyncio
+            import importlib
+            import config
+            # ★ Bug-A 修正: スレッド内でも config を最新状態に再読込
+            importlib.reload(config)
             from modules.live_bot import LiveBot
 
             self.log_signal.emit(f"監視ボットを起動しました")
@@ -420,8 +424,18 @@ class LiveWorker(QThread):
             finally:
                 loop.close()
 
+        except ImportError as ex:
+            # ★ Bug-B: 依存ライブラリ未インストール時の詳細メッセージ
+            tb = traceback.format_exc()
+            self.log_signal.emit(f"❌ インポートエラー: {ex}")
+            self.log_signal.emit("ℹ️ 依存ライブラリが不足しています。")
+            self.log_signal.emit("   pip install TikTokLive selenium webdriver-manager を実行してください")
+            self.log_signal.emit(f"詳細:\n{tb[:500]}")
+            traceback.print_exc()
         except Exception as ex:
+            tb = traceback.format_exc()
             self.log_signal.emit(f"❌ ボットエラー: {ex}")
+            self.log_signal.emit(f"詳細:\n{tb[:800]}")
             traceback.print_exc()
         finally:
             self.status_signal.emit("⏹ 停止中", C_RED)
@@ -574,14 +588,24 @@ class KinakoApp(QMainWindow):
         for err in (validate_tiktok_id(tid), validate_url(url)):
             if err:
                 QMessageBox.warning(self, "入力エラー", err); return
+        # ★ Bug-C 修正: Chrome が見つからなくても設定保存は続行（警告のみ）
+        # webdriver-manager が ChromeDriver を自動管理するため、
+        # Chrome本体のパス確認に失敗しても実際の動作には支障がない場合がある
+        chrome_warning = ""
         if not find_chrome():
-            QMessageBox.critical(self, "Chrome が見つかりません",
-                "Google Chrome がインストールされているか確認してください。"); return
+            chrome_warning = ("\n\n⚠️ Google Chrome のパスが自動検出できませんでした。\n"
+                              "インストール済みの場合は問題ありません。\n"
+                              "Chrome がない場合は https://www.google.com/chrome/ からインストールしてください。")
         try:
             update_config(tid, url)
+            # ★ Bug-A 修正③: config.py 書き換え後にキャッシュを破棄
+            # 次に import config または importlib.reload(config) した時に
+            # 必ず最新の config.py が読まれるようにする
+            import sys as _sys
+            _sys.modules.pop("config", None)
             QMessageBox.information(self, "セットアップ完了 🎉",
                 f"設定を保存しました！\n\n  ・TikTok ID : @{tid}\n\n"
-                "「📡 ライブ監視」タブから配信監視を開始できます！")
+                "「📡 ライブ監視」タブから配信監視を開始できます！" + chrome_warning)
         except PermissionError:
             QMessageBox.critical(self, "書き込みエラー",
                 f"config.py に書き込めませんでした。\n{CONFIG_FILE}")
@@ -638,14 +662,23 @@ class KinakoApp(QMainWindow):
 
     def _on_live_start(self):
         try:
+            import importlib
             import config
+            # ★ Bug-A 修正: セットアップ後の config.py 書き換えを確実に反映させる
+            # Python は一度 import したモジュールをキャッシュするため、
+            # アプリ起動後にファイルを書き換えても古い値のまま → reload() で強制再読込
+            importlib.reload(config)
             if not config.MY_TIKTOK_USERNAME:
                 raise ValueError("MY_TIKTOK_USERNAME が未設定です")
             if not config.ANALYTICS_URL.startswith("https://livecenter.tiktok.com/"):
                 raise ValueError("ANALYTICS_URL が不正です")
-        except Exception as e:
+        except ValueError as e:
             QMessageBox.critical(self, "セットアップ未完了",
                 f"設定に問題があります。\n\n{e}\n\n「⚙️ セットアップ」タブで設定してください。")
+            return
+        except Exception as e:
+            QMessageBox.critical(self, "設定読み込みエラー",
+                f"config.py の読み込みに失敗しました。\n\n{e}")
             return
 
         self._bot_stop_event.clear()
