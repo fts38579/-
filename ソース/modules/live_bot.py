@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-カワウソマネージャー きなこ – LiveBot  v8.9
+カワウソマネージャー きなこ – LiveBot  v9.0
 変更:
   v8.8: _gift_last を __init__ に移動（競合リスク解消）
   v8.9: stop_event 連携追加（GUI停止ボタンでループ終了）
-        監視停止時のインサイト自動取得コールバックを確実に発火
+  v9.0: [重要修正] client.start() → client.connect() に変更
+        start() は非ブロッキング Task を返すだけで WebSocket が動かない
+        connect() は接続が切れるまでブロックする正しい API
+        gift.name の取得方法を修正（event.gift.name）
+        ログ出力を詳細化してデバッグしやすくした
 """
 
 import sys
@@ -14,15 +18,12 @@ import asyncio
 import threading
 import traceback
 import csv
-import queue
 from typing import Optional, Callable
 
 from TikTokLive import TikTokLiveClient
 from TikTokLive.events import ConnectEvent, DisconnectEvent, GiftEvent, JoinEvent
 
 # ── 定数 ──────────────────────────────────────────────────────────
-_MIN_LOOP_SEC    = 10
-_STREAM_END_SEC  = 30
 _OFFLINE_SEC     = 30
 _BLOCKED_SEC     = 600
 _RETRY_BASE_SEC  = 5
@@ -47,6 +48,7 @@ def _safe_str(v) -> str:
     except: return ""
 
 def _extract_user(event):
+    """イベントからユーザー名・UID を安全に取得"""
     try:
         u    = event.user
         name = _safe_str(getattr(u, "display_name", "") or getattr(u, "nickname", ""))
@@ -58,9 +60,11 @@ def _extract_user(event):
 # ── エラー分類 ────────────────────────────────────────────────────
 def _is_offline_error(e: Exception) -> bool:
     msgs = ("hosting", "offline", "is not online", "is not live",
-            "not currently live", "UserOffline", "LIVE_NOT_FOUND")
+            "not currently live", "UserOffline", "LIVE_NOT_FOUND",
+            "userofflineerror", "usernotfounderror")
     s = str(e).lower()
-    return any(m.lower() in s for m in msgs) or type(e).__name__ in msgs
+    name = type(e).__name__.lower()
+    return any(m.lower() in s for m in msgs) or name in msgs
 
 def _is_blocked_error(e: Exception) -> bool:
     names = ("WebcastBlocked200Error", "DeviceBlocked", "DEVICE_BLOCKED")
@@ -84,7 +88,6 @@ async def _sleep_cd(seconds: int, label: str,
         remaining = end - time.time()
         if remaining <= 0:
             break
-        # 停止要求があればウェイトを即座に中断
         if stop_event and stop_event.is_set():
             print(f"[LiveBot] ⏭ {label} – 停止要求により待機をスキップ")
             break
@@ -166,20 +169,30 @@ class LiveBot:
         self._stream_end_fired = False
         self._should_stop      = False
         self._end_cb_thread: Optional[threading.Thread] = None
-        self._disconnect_event: Optional[asyncio.Event] = None
 
         self._start_time         = None
         self._session_date       = ""
         self._session_start_str  = ""
-
-        # ★ _gift_last を __init__ で初期化（競合リスク解消）
         self._gift_last: dict    = {}
 
         _init_csv()
         _init_viewers_csv()
         print(f"[LiveBot] 初期化完了 – 監視対象: @{self.username}")
 
-    # ── イベント ──────────────────────────────────────────────────
+    def _is_stop_requested(self) -> bool:
+        if self._stop_event and self._stop_event.is_set():
+            return True
+        return self._should_stop
+
+    def _fire_end_callback(self):
+        """on_stream_end_callback をスレッドで安全に一度だけ発火"""
+        if self._on_stream_end_cb:
+            if self._end_cb_thread is None or not self._end_cb_thread.is_alive():
+                self._end_cb_thread = threading.Thread(
+                    target=self._on_stream_end_cb, daemon=False)
+                self._end_cb_thread.start()
+
+    # ── イベントハンドラ ──────────────────────────────────────────
 
     async def _on_connect(self, event: ConnectEvent):
         self._start_time        = time.time()
@@ -187,13 +200,10 @@ class LiveBot:
         self._stream_started    = True
         self._session_date      = time.strftime("%Y-%m-%d")
         self._session_start_str = time.strftime("%H:%M:%S")
-        print(f"[LiveBot] ✅ 配信開始: {self._session_start_str}")
+        print(f"[LiveBot] ✅ 配信開始検知: {self._session_start_str}")
         _append_csv("connect", self.username, "", "配信開始")
 
     async def _on_disconnect(self, event: DisconnectEvent):
-        if self._disconnect_event and not self._disconnect_event.is_set():
-            self._disconnect_event.set()
-
         if self._stream_end_fired:
             return
         self._stream_end_fired = True
@@ -203,10 +213,9 @@ class LiveBot:
             s = int(time.time() - self._start_time)
             duration = f"{s // 60}分{s % 60}秒"
 
-        print(f"[LiveBot] 📴 配信終了 ({duration}): {time.strftime('%H:%M:%S')}")
+        print(f"[LiveBot] 📴 配信終了検知 ({duration}): {time.strftime('%H:%M:%S')}")
         _append_csv("disconnect", self.username, "", f"配信終了 {duration}")
 
-        # リピート率を計算して表示
         total, repeats, rate = _calc_repeat_rate()
         print("=" * 50)
         print(f"[リピート率] 累計ユニーク視聴者: {total}人")
@@ -215,24 +224,29 @@ class LiveBot:
         print("=" * 50)
 
         self._should_stop = True
-
-        if self._on_stream_end_cb:
-            if self._end_cb_thread is None or not self._end_cb_thread.is_alive():
-                self._end_cb_thread = threading.Thread(
-                    target=self._on_stream_end_cb, daemon=False)
-                self._end_cb_thread.start()
+        self._fire_end_callback()
 
     async def _on_gift(self, event: GiftEvent):
         try:
             name, uid = _extract_user(event)
-            gift_name = _safe_str(
-                getattr(event, "gift_name", "") or
-                getattr(getattr(event, "gift", None), "name", "不明"))
-            count = getattr(event, "gift_count", 1) or 1
+            # v9.0 修正: event.gift.name が正しいアクセス方法
+            try:
+                gift_name = _safe_str(event.gift.name) if event.gift else "不明"
+            except Exception:
+                gift_name = _safe_str(getattr(event, "gift_name", "不明"))
+            if not gift_name:
+                gift_name = "不明"
+
+            # ストリーク中（コンボ継続中）は repeat_end が False = まだ続いている
+            # repeat_end が True = ストリーク終了 → その時だけカウント
+            if hasattr(event, 'streaking') and event.streaking:
+                return  # ストリーク継続中はスキップ（重複防止）
+
+            count = getattr(event, "repeat_count", 1) or 1
 
             now    = time.time()
             key    = (uid, gift_name)
-            last_t = self._gift_last.get(key, 0)  # ★ hasattr チェック不要に
+            last_t = self._gift_last.get(key, 0)
             if now - last_t < _GIFT_DEDUP_SEC:
                 return
             self._gift_last[key] = now
@@ -242,152 +256,121 @@ class LiveBot:
 
         except Exception as e:
             print(f"[Gift] 処理エラー: {e}")
+            traceback.print_exc()
 
     async def _on_join(self, event: JoinEvent):
         try:
             name, uid = _extract_user(event)
             print(f"[Join] 👋 {name} が入室しました")
             _append_csv("join", name, uid, "入室")
-
-            # viewers.csv に記録
             if uid and uid != "不明":
                 _append_viewer(
                     self._session_date,
                     self._session_start_str,
                     uid, name
                 )
-
         except Exception as e:
             print(f"[Join] 処理エラー: {e}")
 
     # ── メインループ ──────────────────────────────────────────────
 
-    def _is_stop_requested(self) -> bool:
-        """GUI停止ボタン or 内部停止フラグのいずれかが立っているか確認"""
-        if self._stop_event and self._stop_event.is_set():
-            return True
-        return self._should_stop
-
     async def start(self):
-        retry           = 0
-        last_loop_start = 0.0
-        rl_count        = 0
+        retry    = 0
+        rl_count = 0
 
         while True:
-            # ── GUI 停止ボタンチェック ──────────────────────────────
+            # ── 停止チェック ──────────────────────────────────────
             if self._is_stop_requested():
-                print("[LiveBot] 🛑 停止要求を受け取りました – 監視ループを終了します")
-                # 配信が始まっていた場合はコールバックを発火
+                print("[LiveBot] 🛑 停止要求 – 監視ループを終了します")
                 if self._stream_started and not self._stream_end_fired:
                     self._stream_end_fired = True
                     _append_csv("disconnect", self.username, "", "手動停止")
-                    if self._on_stream_end_cb:
-                        if self._end_cb_thread is None or not self._end_cb_thread.is_alive():
-                            self._end_cb_thread = threading.Thread(
-                                target=self._on_stream_end_cb, daemon=False)
-                            self._end_cb_thread.start()
-                break
-
-            elapsed = time.time() - last_loop_start
-            if elapsed < _MIN_LOOP_SEC:
-                await asyncio.sleep(_MIN_LOOP_SEC - elapsed)
-            last_loop_start = time.time()
-
-            if self._should_stop:
-                print("[LiveBot] ✅ 配信終了 – 監視終了（再配信は exe 再起動）")
+                    self._fire_end_callback()
                 break
 
             print(f"[LiveBot] 🔄 @{self.username} への接続を試みます (試行 {retry + 1})")
             self._stream_started   = False
             self._stream_end_fired = False
-            self._disconnect_event = asyncio.Event()
 
             try:
+                # ★ v9.0 重要修正: start() → connect() に変更
+                # start() は非ブロッキングで Task を返すだけ
+                # connect() は WebSocket が切れるまでブロックする
                 self.client = TikTokLiveClient(unique_id=f"@{self.username}")
                 self.client.add_listener(ConnectEvent,    self._on_connect)
                 self.client.add_listener(DisconnectEvent, self._on_disconnect)
                 self.client.add_listener(GiftEvent,       self._on_gift)
                 self.client.add_listener(JoinEvent,       self._on_join)
 
-                await self.client.start()
-
-                if not self._disconnect_event.is_set():
-                    try:
-                        await asyncio.wait_for(
-                            self._disconnect_event.wait(), timeout=10800)
-                    except asyncio.TimeoutError:
-                        print("[LiveBot] ⚠ 接続タイムアウト (3時間)")
-
+                print(f"[LiveBot] 接続中… (@{self.username})")
+                await self.client.connect()  # ← ここが修正点
+                print(f"[LiveBot] 接続終了 (@{self.username})")
                 rl_count = 0
 
             except Exception as e:
-                err = str(e)
-                if self._disconnect_event and not self._disconnect_event.is_set():
-                    self._disconnect_event.set()
+                err  = str(e)
+                ename = type(e).__name__
 
                 if _is_rate_limit_error(e):
                     rl_count += 1
                     wait = min(1800 * (2 ** (rl_count - 1)), 7200)
                     if "account_hour" in err:  wait = 3600
                     elif "room_id_day" in err: wait = 7200
-                    print(f"[LiveBot] ⏳ レートリミット ({rl_count}回目)")
+                    print(f"[LiveBot] ⏳ レートリミット ({rl_count}回目) – {wait}秒待機")
                     retry = 0
                     await _sleep_cd(wait, "レートリミット待機", self._stop_event)
 
                 elif _is_blocked_error(e):
                     rl_count = 0
-                    print(f"[LiveBot] 🚫 ブロック ({err[:80]})")
+                    print(f"[LiveBot] 🚫 ブロック ({ename}: {err[:80]}) – {_BLOCKED_SEC}秒待機")
                     retry = 0
                     await _sleep_cd(_BLOCKED_SEC, "ブロック待機", self._stop_event)
 
                 elif _is_offline_error(e):
                     rl_count = 0
-                    print(f"[LiveBot] 📴 配信オフライン")
+                    print(f"[LiveBot] 📴 @{self.username} はオフラインです – {_OFFLINE_SEC}秒後に再確認")
                     retry = 0
                     await _sleep_cd(_OFFLINE_SEC, "オフライン待機", self._stop_event)
 
                 else:
                     rl_count = 0
-                    if self._stream_started:
-                        print(f"[LiveBot] ⚠ 配信中に例外 → 配信終了として処理: {err[:80]}")
-                        if not self._stream_end_fired:
-                            self._stream_end_fired = True
-                            duration = ""
-                            if self._start_time:
-                                s = int(time.time() - self._start_time)
-                                duration = f"{s // 60}分{s % 60}秒"
-                            _append_csv("disconnect", self.username, "", f"配信終了(例外) {duration}")
-                            total, repeats, rate = _calc_repeat_rate()
-                            print("=" * 50)
-                            print(f"[リピート率] 累計ユニーク視聴者: {total}人")
-                            print(f"[リピート率] リピーター(2回以上): {repeats}人")
-                            print(f"[リピート率] リピート率: {rate:.1f}%")
-                            print("=" * 50)
-                            if self._on_stream_end_cb:
-                                if self._end_cb_thread is None or not self._end_cb_thread.is_alive():
-                                    self._end_cb_thread = threading.Thread(
-                                        target=self._on_stream_end_cb, daemon=False)
-                                    self._end_cb_thread.start()
+                    print(f"[LiveBot] ❌ 予期しないエラー ({ename}): {err[:120]}")
+                    traceback.print_exc()
+
+                    if self._stream_started and not self._stream_end_fired:
+                        # 配信中に例外 → 配信終了として処理
+                        self._stream_end_fired = True
+                        duration = ""
+                        if self._start_time:
+                            s = int(time.time() - self._start_time)
+                            duration = f"{s // 60}分{s % 60}秒"
+                        _append_csv("disconnect", self.username, "", f"配信終了(例外) {duration}")
+                        total, repeats, rate = _calc_repeat_rate()
+                        print(f"[リピート率] {total}人中 {repeats}人リピーター ({rate:.1f}%)")
+                        self._fire_end_callback()
                         self._should_stop = True
                     else:
                         retry += 1
                         wait = min(_RETRY_BASE_SEC * (2 ** (retry - 1)), _RETRY_MAX_SEC)
-                        print(f"[LiveBot] ❌ エラー ({retry}/{_MAX_RETRIES}) {wait}s: {e}")
-                        traceback.print_exc()
+                        print(f"[LiveBot] リトライ {retry}/{_MAX_RETRIES} – {wait}秒後")
                         if retry >= _MAX_RETRIES:
                             retry = 0
-                            await _sleep_cd(_STREAM_END_SEC, "リトライ待機", self._stop_event)
+                            print(f"[LiveBot] 最大リトライ到達 – しばらく待機")
+                            await _sleep_cd(60, "リトライ超過待機", self._stop_event)
                         else:
                             await _sleep_cd(wait, "リトライ待機", self._stop_event)
 
             finally:
                 try:
                     if self.client:
-                        await self.client.stop()
+                        await self.client.disconnect()
                 except Exception:
                     pass
                 self.client = None
 
+            # _on_disconnect で _should_stop が立った場合もここで終了
             if self._should_stop:
-                print("[LiveBot] ✅ 配信終了 – 監視終了（再配信は exe 再起動）")
+                print("[LiveBot] ✅ 配信終了 – 監視ループ終了")
                 break
+
+        print("[LiveBot] 監視終了")
