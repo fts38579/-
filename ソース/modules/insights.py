@@ -1,6 +1,7 @@
 # ============================================================
-#  modules/insights.py  修正版
+#  modules/insights.py  修正版 v2
 #  修正: _write_csv の拡張子変換ロジック整理、--disable-popup-blocking 削除
+#  追加: webdriver-manager による ChromeDriver 自動管理 (Bug3)
 # ============================================================
 from __future__ import annotations
 
@@ -23,6 +24,13 @@ from selenium.common.exceptions import (
     WebDriverException,
     NoSuchWindowException,
 )
+
+# ── webdriver-manager（ChromeDriver 自動管理）────────────────────
+try:
+    from webdriver_manager.chrome import ChromeDriverManager
+    _HAS_WDM = True
+except ImportError:
+    _HAS_WDM = False
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config  # noqa: E402
@@ -70,7 +78,21 @@ def _build_driver() -> ChromeDriver:
     # ★ --disable-popup-blocking を削除（意図しない新タブの抑制）
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
-    driver = ChromeDriver(options=options)
+
+    # ── ChromeDriver 起動（webdriver-manager 優先）──────────────────
+    if _HAS_WDM:
+        try:
+            print("[Insights] webdriver-manager で ChromeDriver を自動取得中…")
+            service = ChromeService(ChromeDriverManager().install())
+            driver  = ChromeDriver(service=service, options=options)
+            print("[Insights] webdriver-manager: ChromeDriver 起動成功")
+        except Exception as e_wdm:
+            print(f"[Insights] webdriver-manager 失敗 ({e_wdm})、PATH の chromedriver を試みます")
+            driver = ChromeDriver(options=options)
+    else:
+        print("[Insights] webdriver-manager 未インストール – PATH 上の chromedriver を使用")
+        driver = ChromeDriver(options=options)
+
     driver.set_window_size(1366, 900)
     return driver
 

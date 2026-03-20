@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-カワウソマネージャー きなこ – LiveBot  v8.8
-変更: _gift_last を __init__ に移動（競合リスク解消）
+カワウソマネージャー きなこ – LiveBot  v8.9
+変更:
+  v8.8: _gift_last を __init__ に移動（競合リスク解消）
+  v8.9: stop_event 連携追加（GUI停止ボタンでループ終了）
+        監視停止時のインサイト自動取得コールバックを確実に発火
 """
 
 import sys
@@ -72,13 +75,18 @@ def _is_rate_limit_error(e: Exception) -> bool:
     return any(n in s for n in names) or type(e).__name__ in names
 
 # ── カウントダウン付きスリープ ────────────────────────────────────
-async def _sleep_cd(seconds: int, label: str):
+async def _sleep_cd(seconds: int, label: str,
+                    stop_event: Optional[threading.Event] = None):
     end      = time.time() + seconds
     log_step = 60 if seconds >= 600 else 10
     next_log = 0.0
     while True:
         remaining = end - time.time()
         if remaining <= 0:
+            break
+        # 停止要求があればウェイトを即座に中断
+        if stop_event and stop_event.is_set():
+            print(f"[LiveBot] ⏭ {label} – 停止要求により待機をスキップ")
             break
         if time.time() >= next_log:
             m, s = divmod(int(remaining), 60)
@@ -146,9 +154,12 @@ def _calc_repeat_rate() -> tuple:
 
 # ── LiveBot ───────────────────────────────────────────────────────
 class LiveBot:
-    def __init__(self, on_stream_end_callback: Optional[Callable] = None):
+    def __init__(self,
+                 on_stream_end_callback: Optional[Callable] = None,
+                 stop_event: Optional[threading.Event] = None):
         self.username          = config.MY_TIKTOK_USERNAME
         self._on_stream_end_cb = on_stream_end_callback
+        self._stop_event       = stop_event  # GUI 停止ボタンと連携
         self.client            = None
 
         self._stream_started   = False
@@ -251,12 +262,32 @@ class LiveBot:
 
     # ── メインループ ──────────────────────────────────────────────
 
+    def _is_stop_requested(self) -> bool:
+        """GUI停止ボタン or 内部停止フラグのいずれかが立っているか確認"""
+        if self._stop_event and self._stop_event.is_set():
+            return True
+        return self._should_stop
+
     async def start(self):
         retry           = 0
         last_loop_start = 0.0
         rl_count        = 0
 
         while True:
+            # ── GUI 停止ボタンチェック ──────────────────────────────
+            if self._is_stop_requested():
+                print("[LiveBot] 🛑 停止要求を受け取りました – 監視ループを終了します")
+                # 配信が始まっていた場合はコールバックを発火
+                if self._stream_started and not self._stream_end_fired:
+                    self._stream_end_fired = True
+                    _append_csv("disconnect", self.username, "", "手動停止")
+                    if self._on_stream_end_cb:
+                        if self._end_cb_thread is None or not self._end_cb_thread.is_alive():
+                            self._end_cb_thread = threading.Thread(
+                                target=self._on_stream_end_cb, daemon=False)
+                            self._end_cb_thread.start()
+                break
+
             elapsed = time.time() - last_loop_start
             if elapsed < _MIN_LOOP_SEC:
                 await asyncio.sleep(_MIN_LOOP_SEC - elapsed)
@@ -301,19 +332,19 @@ class LiveBot:
                     elif "room_id_day" in err: wait = 7200
                     print(f"[LiveBot] ⏳ レートリミット ({rl_count}回目)")
                     retry = 0
-                    await _sleep_cd(wait, "レートリミット待機")
+                    await _sleep_cd(wait, "レートリミット待機", self._stop_event)
 
                 elif _is_blocked_error(e):
                     rl_count = 0
                     print(f"[LiveBot] 🚫 ブロック ({err[:80]})")
                     retry = 0
-                    await _sleep_cd(_BLOCKED_SEC, "ブロック待機")
+                    await _sleep_cd(_BLOCKED_SEC, "ブロック待機", self._stop_event)
 
                 elif _is_offline_error(e):
                     rl_count = 0
                     print(f"[LiveBot] 📴 配信オフライン")
                     retry = 0
-                    await _sleep_cd(_OFFLINE_SEC, "オフライン待機")
+                    await _sleep_cd(_OFFLINE_SEC, "オフライン待機", self._stop_event)
 
                 else:
                     rl_count = 0
@@ -345,9 +376,9 @@ class LiveBot:
                         traceback.print_exc()
                         if retry >= _MAX_RETRIES:
                             retry = 0
-                            await _sleep_cd(_STREAM_END_SEC, "リトライ待機")
+                            await _sleep_cd(_STREAM_END_SEC, "リトライ待機", self._stop_event)
                         else:
-                            await _sleep_cd(wait, "リトライ待機")
+                            await _sleep_cd(wait, "リトライ待機", self._stop_event)
 
             finally:
                 try:
